@@ -136,25 +136,37 @@ cpdef ndarray[int64_t, ndim=1] unique_deltas(const int64_t[:] arr):
         An ordered ndarray[int64_t]
     """
     cdef:
-        Py_ssize_t i, n = len(arr)
+        Py_ssize_t i, n = len(arr), num_uniques = 0
         int64_t val
         khiter_t k
         kh_int64_t *table
         int ret = 0
-        list uniques = []
+        int64_t *uniques = NULL
         ndarray[int64_t, ndim=1] result
 
     table = kh_init_int64()
     kh_resize_int64(table, 10)
+
+    # n - 1 is the max possible number of unique deltas
+    if n > 1:
+        uniques = <int64_t*>malloc((n - 1) * sizeof(int64_t))
+        if uniques is NULL:
+            kh_destroy_int64(table)
+            raise MemoryError()
+
     for i in range(n - 1):
         val = arr[i + 1] - arr[i]
         k = kh_get_int64(table, val)
         if k == table.n_buckets:
             kh_put_int64(table, val, &ret)
-            uniques.append(val)
+            uniques[num_uniques] = val
+            num_uniques += 1
     kh_destroy_int64(table)
 
-    result = np.array(uniques, dtype=np.int64)
+    result = np.empty(num_uniques, dtype=np.int64)
+    if num_uniques > 0:
+        memcpy(cnp.PyArray_DATA(result), uniques, num_uniques * sizeof(int64_t))
+    free(uniques)
     result.sort()
     return result
 
@@ -710,6 +722,125 @@ def pad_2d_inplace(numeric_object_t[:, :] values, uint8_t[:, :] mask, limit=None
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
+def scalar_fillna_inplace(
+    numeric_object_t[:] values,
+    numeric_object_t fill_val,
+    uint8_t[:] mask=None,
+    bint is_datetimelike=False,
+    limit=None,
+) -> Py_ssize_t:
+    """
+    Fill NA values in `values` with `fill_val` in a single pass.
+
+    NA detection strategy (in priority order):
+    - If `mask` is provided, NA positions are read from the mask and
+      filled entries are cleared.
+    - If `is_datetimelike` is True (int64 values), NA is ``NPY_NAT``.
+    - For object dtype, NA is detected via ``checknull``.
+    - For other numeric dtypes, NA is detected via NaN-check.
+
+    Parameters
+    ----------
+    values : 1D memoryview, modified in-place
+    fill_val : scalar fill value (same fused type as values)
+    mask : optional uint8 memoryview indicating NA positions, modified in-place
+    is_datetimelike : bool, default False
+        True if `values` contains datetime-like entries (int64 with
+        NPY_NAT sentinel).
+    limit : int or None
+        Maximum number of NA values to fill. If None, fill all.
+
+    Returns
+    -------
+    Py_ssize_t
+        Number of values filled.
+    """
+    cdef:
+        Py_ssize_t i, N, filled = 0
+        int lim
+        bint isna_val, uses_mask = mask is not None
+
+    N = len(values)
+    if N == 0:
+        return 0
+
+    lim = validate_limit(N, limit)
+
+    with nogil(numeric_object_t is not object):
+        for i in range(N):
+            if uses_mask:
+                isna_val = mask[i]
+            elif numeric_object_t is object:
+                isna_val = checknull(values[i])
+            elif numeric_object_t is int64_t and is_datetimelike:
+                isna_val = values[i] == NPY_NAT
+            else:
+                isna_val = values[i] != values[i]
+            if isna_val:
+                if filled >= lim:
+                    break
+                filled += 1
+                values[i] = fill_val
+                if uses_mask:
+                    mask[i] = 0
+
+    return filled
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def scalar_fillna_2d_inplace(
+    numeric_object_t[:, :] values,
+    numeric_object_t fill_val,
+    limit=None,
+) -> Py_ssize_t:
+    """
+    Fill NA values in 2D `values` with `fill_val` in a single pass.
+
+    The limit is applied per-column (axis=1 of block values).
+
+    Parameters
+    ----------
+    values : 2D memoryview (K, N), modified in-place
+    fill_val : scalar fill value
+    limit : int or None
+
+    Returns
+    -------
+    Py_ssize_t
+        Total number of values filled.
+    """
+    cdef:
+        Py_ssize_t i, j, K, N, filled = 0
+        int lim, col_fill_count
+        bint isna_val
+
+    K, N = (<object>values).shape
+    if N == 0 or K == 0:
+        return 0
+
+    lim = validate_limit(N, limit)
+
+    with nogil(numeric_object_t is not object):
+        for j in range(K):
+            col_fill_count = 0
+            for i in range(N):
+                if numeric_object_t is object:
+                    isna_val = checknull(values[j, i])
+                else:
+                    isna_val = values[j, i] != values[j, i]
+                if isna_val:
+                    if col_fill_count >= lim:
+                        continue
+                    col_fill_count += 1
+                    values[j, i] = fill_val
+                    filled += 1
+
+    return filled
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
 def backfill(
     const numeric_object_t[:] old,
     const numeric_object_t[:] new,
@@ -859,8 +990,6 @@ def is_monotonic(const numeric_object_t[:] arr, bint timelike):
                 is_monotonic_dec = 0
                 break
             if not is_monotonic_inc and not is_monotonic_dec:
-                is_monotonic_inc = 0
-                is_monotonic_dec = 0
                 break
             prev = cur
 
@@ -1038,7 +1167,6 @@ def rank_1d(
     # will flip the ordering to still end up with lowest rank.
     # Symmetric logic applies to `na_option == 'bottom'`
     nans_rank_highest = ascending ^ (na_option == "top")
-    nan_fill_val = get_rank_nan_fill_val(nans_rank_highest, <numeric_object_t>0)
     if nans_rank_highest:
         order = [masked_vals, mask]
     else:
@@ -1047,7 +1175,9 @@ def rank_1d(
     if check_labels:
         order.append(labels)
 
-    np.putmask(masked_vals, mask, nan_fill_val)
+    if check_mask:
+        nan_fill_val = get_rank_nan_fill_val(nans_rank_highest, <numeric_object_t>0)
+        np.putmask(masked_vals, mask, nan_fill_val)
     # putmask doesn't accept a memoryview, so we assign as a separate step
     masked_vals_memview = masked_vals
 
@@ -1140,7 +1270,6 @@ cdef void rank_sorted_1d(
     # array that we sorted previously, which gives us the location of
     # that sorted value for retrieval back from the original
     # values / masked_vals arrays
-    # TODO(cython3): de-duplicate once cython supports conditional nogil
     with gil(numeric_object_t is object):
         for i in range(N):
             at_end = i == N - 1
@@ -1486,15 +1615,27 @@ cdef void accumulate_moments_scalar(
 ) noexcept nogil:
     cdef:
         Py_ssize_t i, n = len(values)
-        bint uses_mask = mask is not None
+        bint is_na_entry, uses_mask = mask is not None
         float64_t val
 
     for i in range(n):
         val = values[i]
-        if uses_mask and mask[i]:
-            val = NaN
-        if skipna and isnan(val):
+        if uses_mask:
+            is_na_entry = mask[i]
+        else:
+            is_na_entry = isnan(val)
+
+        if skipna and is_na_entry:
             continue
+        elif is_na_entry:
+            if max_moment >= 4:
+                m4[0] = NaN
+            if max_moment >= 3:
+                m3[0] = NaN
+            m2[0] = NaN
+            mean[0] = NaN
+            nobs[0] = n
+            return
         moments_add_value(val, nobs, mean, m2, m3, m4, max_moment)
 
 
@@ -1515,7 +1656,7 @@ cdef void accumulate_moments_axis(
     cdef:
         Py_ssize_t i, j, nrows = values.shape[0], ncols = values.shape[1]
         Py_ssize_t nouter, ninner
-        bint uses_mask = mask is not None
+        bint is_na_entry, uses_mask = mask is not None
         float64_t val
         float64_t* m3_ptr = NULL
         float64_t* m4_ptr = NULL
@@ -1536,10 +1677,22 @@ cdef void accumulate_moments_axis(
             m4_ptr = &m4[i]
         for j in range(ninner):
             val = values[j, i] if axis == 0 else values[i, j]
-            if uses_mask and (mask[j, i] if axis == 0 else mask[i, j]):
-                val = NaN
-            if skipna and isnan(val):
+            if uses_mask:
+                is_na_entry = mask[j, i] if axis == 0 else mask[i, j]
+            else:
+                is_na_entry = isnan(val)
+
+            if skipna and is_na_entry:
                 continue
+            elif is_na_entry:
+                if max_moment >= 4:
+                    m4[i] = NaN
+                if max_moment >= 3:
+                    m3[i] = NaN
+                m2[i] = NaN
+                mean[i] = NaN
+                nobs[i] = ninner
+                break
             moments_add_value(val, &nobs[i], &mean[i], &m2[i], m3_ptr, m4_ptr,
                               max_moment)
 

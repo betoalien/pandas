@@ -32,7 +32,6 @@ from cpython.exc cimport (
 from cpython.long cimport PyLong_FromString
 from cpython.object cimport PyObject
 from cpython.ref cimport (
-    Py_INCREF,
     Py_XDECREF,
 )
 from cpython.unicode cimport (
@@ -147,9 +146,9 @@ cdef extern from "pandas/parser/tokenizer.h":
     enum: ERROR_OVERFLOW, ERROR_INVALID_CHARS
 
     ctypedef enum BadLineHandleMethod:
-        ERROR,
-        WARN,
-        SKIP
+        BLHM_ERROR,
+        BLHM_WARN,
+        BLHM_SKIP
 
     ctypedef char* (*io_callback)(void *src, size_t nbytes, size_t *bytes_read,
                                   int *status, const char *encoding_errors)
@@ -269,12 +268,14 @@ cdef extern from "pandas/parser/pd_parser.h":
 
     void parser_set_default_options(parser_t *self)
 
-    int parser_consume_rows(parser_t *self, size_t nrows)
+    int parser_consume_rows(parser_t *self, uint64_t nrows)
 
     int parser_trim_buffers(parser_t *self)
 
     int tokenize_all_rows(parser_t *self, const char *encoding_errors) nogil
-    int tokenize_nrows(parser_t *self, size_t nrows, const char *encoding_errors) nogil
+    int tokenize_nrows(
+        parser_t *self, uint64_t nrows, const char *encoding_errors
+    ) nogil
 
     int64_t str_to_int64(char *p_item,  int *error, char tsep) nogil
     uint64_t str_to_uint64(uint_state *state, char *p_item, int *error, char tsep) nogil
@@ -323,6 +324,7 @@ cdef class TextReader:
         bint allow_leading_cols
         uint64_t parser_start  # this is modified after __init__
         const char *encoding_errors
+        object _encoding_errors
         kh_str_starts_t *false_set
         kh_str_starts_t *true_set
         int64_t buffer_lines, skipfooter
@@ -364,7 +366,7 @@ cdef class TextReader:
                   thousands=None,       # bytes | str
                   dtype=None,
                   usecols=None,
-                  on_bad_lines=ERROR,
+                  on_bad_lines=BLHM_ERROR,
                   bint na_filter=True,
                   na_values=None,       # dict[hashable, set[str]] | set[str]
                   na_fvalues=None,      # dict[hashable, set[float]] | set[float]
@@ -384,7 +386,8 @@ cdef class TextReader:
             encoding_errors = encoding_errors.encode("utf-8")
         elif encoding_errors is None:
             encoding_errors = b"strict"
-        Py_INCREF(encoding_errors)
+        # store encoding_errors in `self` for Cython to manage its lifetime.
+        self._encoding_errors = encoding_errors
         self.encoding_errors = PyBytes_AsString(encoding_errors)
 
         self.parser = parser_new()
@@ -458,7 +461,7 @@ cdef class TextReader:
             self.usecols = usecols
 
         if skipfooter > 0:
-            self.parser.on_bad_lines = SKIP
+            self.parser.on_bad_lines = BLHM_SKIP
 
         self.delimiter = delimiter
 
@@ -835,7 +838,7 @@ cdef class TextReader:
 
         return chunks
 
-    cdef _tokenize_rows(self, size_t nrows):
+    cdef _tokenize_rows(self, uint64_t nrows):
         cdef:
             int status
 
@@ -923,8 +926,7 @@ cdef class TextReader:
             end = min(start + rows, self.parser.lines)
 
         num_cols = -1
-        # Py_ssize_t cast prevents build warning
-        for i in range(<Py_ssize_t>self.parser.lines):
+        for i in range(<int64_t>self.parser.lines):
             num_cols = (num_cols < self.parser.line_fields[i]) * \
                 self.parser.line_fields[i] + \
                 (num_cols >= self.parser.line_fields[i]) * num_cols
@@ -1173,6 +1175,12 @@ cdef class TextReader:
             if result is not None and dtype != "float64":
                 result = result.astype(dtype)
             return result, na_count
+        elif dtype.kind == "c":
+            # GH#9379 numpy parses both "1+2j" and "(1+2j)" forms; the
+            # latter is what to_csv writes for complex columns.
+            result, na_count = self._string_convert(i, start, end, na_filter,
+                                                    na_hashset)
+            return np.asarray(result, dtype=dtype), na_count
         elif dtype.kind == "b":
             result, na_count = _try_bool_flex(self.parser, i, start, end,
                                               na_filter, na_hashset,
@@ -1766,6 +1774,7 @@ cdef int _try_uint64_nogil(parser_t *parser, int64_t col,
         Py_ssize_t i, lines = line_end - line_start
         coliter_t it
         const char *word = NULL
+        char thousands = parser.thousands
 
     coliter_setup(&it, parser, col, line_start)
 
@@ -1778,13 +1787,13 @@ cdef int _try_uint64_nogil(parser_t *parser, int64_t col,
                 data[i] = 0
                 continue
 
-            data[i] = str_to_uint64(state, word, &error, parser.thousands)
+            data[i] = str_to_uint64(state, word, &error, thousands)
             if error != 0:
                 return error
     else:
         for i in range(lines):
             COLITER_NEXT(it, word)
-            data[i] = str_to_uint64(state, word, &error, parser.thousands)
+            data[i] = str_to_uint64(state, word, &error, thousands)
             if error != 0:
                 return error
 
@@ -1830,6 +1839,7 @@ cdef int _try_int64_nogil(parser_t *parser, int64_t col,
         Py_ssize_t i, lines = line_end - line_start
         coliter_t it
         const char *word = NULL
+        char thousands = parser.thousands
 
     na_count[0] = 0
     coliter_setup(&it, parser, col, line_start)
@@ -1843,13 +1853,13 @@ cdef int _try_int64_nogil(parser_t *parser, int64_t col,
                 data[i] = NA
                 continue
 
-            data[i] = str_to_int64(word, &error, parser.thousands)
+            data[i] = str_to_int64(word, &error, thousands)
             if error != 0:
                 return error
     else:
         for i in range(lines):
             COLITER_NEXT(it, word)
-            data[i] = str_to_int64(word, &error, parser.thousands)
+            data[i] = str_to_int64(word, &error, thousands)
             if error != 0:
                 return error
 
@@ -2081,6 +2091,8 @@ def _compute_na_values():
     na_values = {
         np.float32: np.nan,
         np.float64: np.nan,
+        np.complex64: np.nan,
+        np.complex128: np.nan,
         np.int64: int64info.min,
         np.int32: int32info.min,
         np.int16: int16info.min,
